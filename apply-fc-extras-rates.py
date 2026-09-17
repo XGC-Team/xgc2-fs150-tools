@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Persist PX4 msgid 31/32 at 15 Hz in /fs/microsd/etc/extras.txt.
+"""Persist PX4 msgid 30/31/32 at 15 Hz in /fs/microsd/etc/extras.txt.
 
 Talks MAVLink nsh on 127.0.0.1:14561. No pymavlink. Does not reboot.
-LOCAL_POSITION_NED may be silent without vision; ATTITUDE_QUATERNION is
-the field proof that extras stream -r is honored.
+Do not BlockMsgIdOut 30 or 31; both stay on the air at 15 Hz.
+LOCAL_POSITION_NED may be silent without vision.
 """
 from __future__ import print_function
 
@@ -17,7 +17,7 @@ import time
 STREAM_RE = re.compile(
     r"^mavlink stream -d (/dev/ttyS\d+) -s\s+(\S+) -r (\d+)\s*$"
 )
-WANT = (("LOCAL_POSITION_NED", "15"), ("ATTITUDE_QUATERNION", "15"))
+WANT = (("LOCAL_POSITION_NED", "15"), ("ATTITUDE_QUATERNION", "15"), ("ATTITUDE", "15"))
 CRC_EXTRA = {0: 50, 126: 220}
 ARMED_FLAG = 128
 DEV_SHELL = 10
@@ -48,13 +48,18 @@ def heartbeat_pkt(seq):
 
 
 def serial_control_pkt(seq, flags, data):
+    """SERIAL_CONTROL wire order, not XML order.
+
+    baudrate u32, timeout u16, device u8, flags u8, count u8, data[70].
+    PX4 1.12 MIN_LEN is 79 (no target_system extension).
+    """
     chunk = data[:70]
     payload = struct.pack(
-        "<BBHIB70s",
+        "<IHBBB70s",
+        0,
+        0,
         DEV_SHELL,
         flags,
-        0,
-        0,
         len(chunk),
         chunk.ljust(70, b"\x00"),
     )
@@ -113,13 +118,18 @@ def merge_extras(text):
 
 
 def extras_ok(text):
-    if "LOCAL_POSITION_NED -r 30" in text or "LOCAL_POSITION_NED  -r 30" in text:
-        return False
-    if "ATTITUDE_QUATERNION -r 15" not in text and "ATTITUDE_QUATERNION  -r 15" not in text:
-        return False
-    if "LOCAL_POSITION_NED -r 15" not in text and "LOCAL_POSITION_NED  -r 15" not in text:
-        return False
-    return True
+    want = dict(WANT)
+    found = {name: False for name in want}
+    for ln in text.splitlines():
+        m = STREAM_RE.match(ln.strip()) if ln.strip() else None
+        if not m:
+            continue
+        stream, rate = m.group(2), m.group(3)
+        if stream in want:
+            if rate != want[stream]:
+                return False
+            found[stream] = True
+    return all(found.values())
 
 
 def self_test():
@@ -132,10 +142,21 @@ def self_test():
     )
     merged = merge_extras(sample)
     assert extras_ok(merged), merged
-    assert "ATTITUDE -r 10" in merged
+    assert "ATTITUDE -r 15" in merged
+    assert "ATTITUDE -r 10" not in merged
     assert "GPS_RAW_INT -r 5" in merged
     empty = merge_extras("")
     assert extras_ok(empty), empty
+    flags = FLAG_RESPOND | FLAG_EXCLUSIVE | FLAG_MULTI
+    raw = serial_control_pkt(0, flags, b"ls\n")
+    assert raw[0:1] == b"\xfe"
+    plen = raw[1]
+    payload = raw[6 : 6 + plen]
+    assert plen == 79, plen
+    assert payload[6] == DEV_SHELL, payload[6]
+    assert payload[7] == flags, payload[7]
+    assert payload[8] == 3, payload[8]
+    assert payload[9:12] == b"ls\n"
     print("extras merge self-test ok")
     return 0
 
@@ -187,7 +208,8 @@ class Link(object):
                 continue
             msgid, payload, sysid = msg
             if msgid == 0 and sysid != 255 and len(payload) >= 7:
-                if payload[4] == 12:
+                # HEARTBEAT: type@4, autopilot@5 (PX4=12), base_mode@6
+                if payload[5] == 12:
                     armed = (payload[6] & ARMED_FLAG) != 0
                     return True, armed
         return False, False
@@ -202,6 +224,7 @@ class Link(object):
         out = b""
         t0 = time.time()
         while time.time() - t0 < wait:
+            self.pump_hb()
             msg = self.recv_msg(0.4)
             if not msg:
                 continue
@@ -253,7 +276,7 @@ def apply_extras(host, port, seconds):
         print("error: extras verify failed\n%s" % verify, file=sys.stderr)
         print("backup nsh:\n%s" % bak, file=sys.stderr)
         return 1
-    print("wrote 31/32 @ 15 Hz into extras.txt (takes effect on next FC reboot)")
+    print("wrote 30/31/32 @ 15 Hz into extras.txt (takes effect on next FC reboot)")
     print(verify)
     return 0
 

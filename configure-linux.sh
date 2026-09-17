@@ -5,8 +5,11 @@
 # - Quarantine other apt list files that break `apt-get update`
 # - Stop/disable/mask vendor mavlink routers; free /dev/ttyS7
 # - Install + enable xgc2-fs150-mavlink-router (UART Baud = 921600 hard rule)
-# - Pin remote BlockMsgIdOut = 105, 106, 331, 132, 30 (conffile may be old)
-# - Persist 31/32 @ 15 Hz in FC extras.txt (not the rates systemd loop)
+# - Pin remote BlockMsgIdOut = 105, 106, 331, 132 (conffile may be old)
+# - Persist 30/31/32 @ 15 Hz in FC extras.txt (not a rates systemd loop)
+# - Retract APT 0.1.0-20 (block 30 + rates Wants); pin file has no extra
+#   dots (apt ignores preferences.d names like *.0-20). Stay on installed
+#   (17/19) until 21. If companion clock is days behind, set from apt HTTP Date.
 # - Verify FC HEARTBEAT on the local unfiltered UDP port
 # - If silent, lift PX4 SER_TEL1_BAUD from vendor 115200 to 921600 on the
 #   UART (stop router, talk 115200, reboot FC, start router). Never rewrite
@@ -49,7 +52,11 @@ RATES_UNIT="xgc2-fs150-mavlink-rates.service"
 ROUTER_CONF="/etc/xgc2/fs150-mavlink-router/router.conf"
 UART_DEVICE="/dev/ttyS7"
 EXPECT_BAUD="921600"
-EXPECT_BLOCK_OUT="105, 106, 331, 132, 30"
+EXPECT_BLOCK_OUT="105, 106, 331, 132"
+RETRACTED_FS150_DEB="0.1.0-20"
+# apt ignores preferences.d names with extra dots (not .pref). Do not
+# put 0.1.0-20 in the filename.
+RETRACT_PIN="/etc/apt/preferences.d/xgc2-fs150-retract-20"
 VENDOR_BAUD="115200"
 LOCAL_MAVLINK_UDP="127.0.0.1:14561"
 LINK_CHECK_SECONDS="${LINK_CHECK_SECONDS:-12}"
@@ -460,8 +467,92 @@ note_preexisting_uart_baud() {
   fi
 }
 
+sync_clock_from_http() {
+  # Companion clocks often sit days behind; apt then refuses InRelease.
+  local url hdr epoch_http epoch_now skew
+  url="${APT_BASE_URL%/}/dists/${APT_SUITE}/InRelease"
+  hdr="$(curl -sI --connect-timeout 8 --max-time 15 "${url}" 2>/dev/null \
+    | awk 'BEGIN{IGNORECASE=1} /^Date:/{sub(/^Date:[[:space:]]*/,""); gsub(/\r/,""); print; exit}')"
+  if [[ -z "${hdr}" ]]; then
+    warn "no HTTP Date from apt; leave companion clock"
+    return 0
+  fi
+  epoch_http="$(date -u -d "${hdr}" +%s 2>/dev/null || true)"
+  epoch_now="$(date -u +%s)"
+  if [[ -z "${epoch_http}" ]]; then
+    warn "could not parse apt HTTP Date: ${hdr}"
+    return 0
+  fi
+  skew=$(( epoch_now - epoch_http ))
+  if [[ "${skew}" -lt 0 ]]; then
+    skew=$(( -skew ))
+  fi
+  if [[ "${skew}" -lt 3600 ]]; then
+    log "companion clock skew ${skew}s; leave it"
+    return 0
+  fi
+  date -u -s "$(date -u -d "${hdr}" '+%Y-%m-%d %H:%M:%S')" >/dev/null
+  log "set clock from apt HTTP Date (${hdr}); was ${skew}s off"
+}
+
+write_retract_pin() {
+  mkdir -p /etc/apt/preferences.d
+  rm -f /etc/apt/preferences.d/xgc2-fs150-retract-0.1.0-20
+  cat > "${RETRACT_PIN}" <<EOF
+Package: xgc2-fs150-mavlink-router
+Pin: version ${RETRACTED_FS150_DEB}
+Pin-Priority: -1
+
+Package: xgc2-fs150
+Pin: version ${RETRACTED_FS150_DEB}
+Pin-Priority: -1
+EOF
+  log "APT pin ${RETRACT_PIN} forbids ${RETRACTED_FS150_DEB}"
+}
+
+assert_router_not_retracted() {
+  local cand inst
+  cand="$(apt-cache policy "${ROUTER_PKG}" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
+  inst="$(apt-cache policy "${ROUTER_PKG}" 2>/dev/null | awk '/Installed:/ {print $2; exit}')"
+  if [[ "${cand}" == "${RETRACTED_FS150_DEB}" ]]; then
+    die "${ROUTER_PKG} candidate ${RETRACTED_FS150_DEB} is retracted; stay on installed until 0.1.0-21"
+  fi
+  if [[ "${inst}" == "${RETRACTED_FS150_DEB}" ]]; then
+    die "installed ${ROUTER_PKG} ${RETRACTED_FS150_DEB} is retracted; install 0.1.0-19 or 0.1.0-21"
+  fi
+}
+
+retire_rates_helper() {
+  # 0.1.0-20 leftover. Persistence is extras.txt, not SET_MESSAGE_INTERVAL.
+  if systemctl cat "${RATES_UNIT}" >/dev/null 2>&1 \
+    || [[ -e "/etc/systemd/system/${RATES_UNIT}" ]] \
+    || [[ -e "/lib/systemd/system/${RATES_UNIT}" ]]; then
+    log "stop/disable/mask leftover ${RATES_UNIT}"
+    systemctl stop "${RATES_UNIT}" >/dev/null 2>&1 || true
+    systemctl disable "${RATES_UNIT}" >/dev/null 2>&1 || true
+  fi
+  systemctl mask "${RATES_UNIT}" >/dev/null 2>&1 || true
+}
+
+wait_dpkg_lock() {
+  local n=0
+  while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+    || fuser /var/lib/dpkg/lock >/dev/null 2>&1; do
+    n=$((n + 1))
+    if [[ "${n}" -gt 30 ]]; then
+      die "dpkg lock still held after 60s"
+    fi
+    log "wait dpkg lock (${n})"
+    sleep 2
+  done
+}
+
 install_router_package() {
+  sync_clock_from_http
+  write_retract_pin
   apt_update_resilient
+  assert_router_not_retracted
+  wait_dpkg_lock
   log "apt-get install -y --no-install-recommends ${ROUTER_PKG}"
   DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${ROUTER_PKG}"
   dpkg -s "${ROUTER_PKG}" >/dev/null
@@ -471,6 +562,7 @@ install_router_package() {
     || die "expected packaged Baud = ${EXPECT_BAUD} in ${ROUTER_CONF}"
   grep -q "^Device = ${UART_DEVICE}$" "${ROUTER_CONF}" \
     || die "expected Device = ${UART_DEVICE} in ${ROUTER_CONF}"
+  assert_router_not_retracted
 }
 
 ensure_block_msg_ids() {
@@ -498,11 +590,7 @@ enable_router() {
   systemctl restart "${ROUTER_UNIT}"
   systemctl is-active --quiet "${ROUTER_UNIT}" || die "${ROUTER_UNIT} failed to start"
   systemctl is-enabled --quiet "${ROUTER_UNIT}" || die "${ROUTER_UNIT} not enabled"
-  if systemctl is-active --quiet "${RATES_UNIT}"; then
-    log "stopping ${RATES_UNIT}; 31/32 persistence is extras.txt"
-    systemctl stop "${RATES_UNIT}" >/dev/null 2>&1 || true
-    systemctl disable "${RATES_UNIT}" >/dev/null 2>&1 || true
-  fi
+  retire_rates_helper
   # Confirm journal reports the hard-rule baud.
   if ! journalctl -u "${ROUTER_UNIT}" -n 30 --no-pager 2>/dev/null \
       | grep -Eq "speed = ${EXPECT_BAUD}|Baud = ${EXPECT_BAUD}"; then
@@ -887,7 +975,7 @@ smoke() {
 EOF
   log "next: Insert check apt boot"
   log "remote BlockMsgIdOut = ${EXPECT_BLOCK_OUT}"
-  log "onboard extras.txt: 31/32 @ 15 Hz (next FC reboot)"
+  log "onboard extras.txt: 30/31/32 @ 15 Hz (next FC reboot)"
   log "done"
 }
 
@@ -910,7 +998,7 @@ ensure_link_or_lift() {
 
 apply_fc_extras_rates() {
   local py="${SCRIPT_DIR}/apply-fc-extras-rates.py"
-  log "persist 31/32 @ 15 Hz in FC extras.txt"
+  log "persist 30/31/32 @ 15 Hz in FC extras.txt"
   if [[ -f "${py}" ]]; then
     python3 "${py}" --host 127.0.0.1 --port 14561 --wait "${LINK_CHECK_SECONDS}"
     return
@@ -919,7 +1007,7 @@ apply_fc_extras_rates() {
   python3 - --host 127.0.0.1 --port 14561 --wait "${LINK_CHECK_SECONDS}" <<'PY'
 import argparse, re, socket, struct, sys, time
 STREAM_RE = re.compile(r"^mavlink stream -d (/dev/ttyS\d+) -s\s+(\S+) -r (\d+)\s*$")
-WANT = (("LOCAL_POSITION_NED", "15"), ("ATTITUDE_QUATERNION", "15"))
+WANT = (("LOCAL_POSITION_NED", "15"), ("ATTITUDE_QUATERNION", "15"), ("ATTITUDE", "15"))
 CRC_EXTRA = {0: 50, 126: 220}
 ARMED_FLAG = 128
 DEV_SHELL, FLAG_RESPOND, FLAG_EXCLUSIVE, FLAG_MULTI = 10, 2, 4, 16
@@ -942,7 +1030,8 @@ def heartbeat_pkt(seq):
 
 def serial_control_pkt(seq, flags, data):
     chunk = data[:70]
-    payload = struct.pack("<BBHIB70s", DEV_SHELL, flags, 0, 0, len(chunk), chunk.ljust(70, b"\x00"))
+    # Wire order: baudrate u32, timeout u16, device, flags, count, data[70]
+    payload = struct.pack("<IHBBB70s", 0, 0, DEV_SHELL, flags, len(chunk), chunk.ljust(70, b"\x00"))
     return pack_v1(126, payload, seq)
 
 def parse_one(buf):
@@ -997,9 +1086,15 @@ def merge_extras(text):
 def extras_ok(text):
     if "LOCAL_POSITION_NED -r 30" in text or "LOCAL_POSITION_NED  -r 30" in text:
         return False
+    if "ATTITUDE -r 10" in text or "ATTITUDE  -r 10" in text:
+        return False
+    if "ATTITUDE -r 30" in text or "ATTITUDE  -r 30" in text:
+        return False
     if "ATTITUDE_QUATERNION -r 15" not in text and "ATTITUDE_QUATERNION  -r 15" not in text:
         return False
     if "LOCAL_POSITION_NED -r 15" not in text and "LOCAL_POSITION_NED  -r 15" not in text:
+        return False
+    if "ATTITUDE -r 15" not in text and "ATTITUDE  -r 15" not in text:
         return False
     return True
 
@@ -1040,7 +1135,8 @@ class Link(object):
             if not msg:
                 continue
             msgid, payload, sysid = msg
-            if msgid == 0 and sysid != 255 and len(payload) >= 7 and payload[4] == 12:
+            # HEARTBEAT: type@4, autopilot@5 (PX4=12), base_mode@6
+            if msgid == 0 and sysid != 255 and len(payload) >= 7 and payload[5] == 12:
                 return True, (payload[6] & ARMED_FLAG) != 0
         return False, False
     def nsh(self, cmd, wait=2.0):
@@ -1053,6 +1149,7 @@ class Link(object):
         out = b""
         t0 = time.time()
         while time.time() - t0 < wait:
+            self.send(heartbeat_pkt(self.seq))
             msg = self.recv_msg(0.4)
             if not msg:
                 continue
@@ -1100,7 +1197,7 @@ link.close_shell()
 if not extras_ok(verify):
     sys.stderr.write("error: extras verify failed\n")
     sys.exit(1)
-print("wrote 31/32 @ 15 Hz into extras.txt (takes effect on next FC reboot)")
+print("wrote 30/31/32 @ 15 Hz into extras.txt (takes effect on next FC reboot)")
 sys.exit(0)
 PY
 }
@@ -1108,6 +1205,8 @@ PY
 if [[ "${SELF_TEST}" -eq 1 ]]; then
   baud_lift_self_test
   block_self_test
+  [[ "${RETRACTED_FS150_DEB}" == "0.1.0-20" ]] \
+    || die "retracted FS150 deb must stay 0.1.0-20 until 0.1.0-21 is live"
   python3 "${SCRIPT_DIR}/apply-fc-extras-rates.py" --self-test
   exit 0
 fi

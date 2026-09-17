@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # FS150 field network: write Wi-Fi + static IPv4. Does not reconnect.
-# Next step is apply-network.sh.
+# Next step is apply-network.sh. After this runs, the field profile is the
+# only Wi-Fi profile that autoconnects, so boot joins the field /24 without
+# a leftover SSID winning the race.
 #
 # Requires --lan-address. SSID/PSK from site.env or flags.
 # /32 is rewritten to /24.
@@ -35,6 +37,10 @@ WIFI_IFACE="${FS150_WIFI_IFACE:-wlan0}"
 LAN_ADDRESS="${FS150_LAN_ADDRESS:-}"
 LAN_GATEWAY="${FS150_LAN_GATEWAY:-192.168.51.1}"
 LAN_DNS="${FS150_LAN_DNS:-192.168.51.1}"
+# Leftover Wi-Fi profiles were often saved at a higher or equal priority,
+# so NetworkManager raced at boot. Field Wi-Fi must outrank them and be
+# the only Wi-Fi autoconnect.
+FIELD_WIFI_AUTOCONNECT_PRIORITY=400
 
 usage() {
   cat <<'EOF'
@@ -118,12 +124,27 @@ active_wifi_connection() {
     | awk -F: '$2 == "802-11-wireless" { print $1; exit }'
 }
 
+# Same-SSID demotion is not enough: a leftover profile for another AP
+# still wins the boot race.
+demote_competing_wifi_profiles() {
+  local keep="$1"
+  local name type
+  while IFS=: read -r name type; do
+    [[ "${type}" == "802-11-wireless" ]] || continue
+    [[ -n "${name}" && "${name}" != "${keep}" ]] || continue
+    nmcli connection modify "${name}" \
+      connection.autoconnect no \
+      connection.autoconnect-priority 0
+    log "disable competing Wi-Fi autoconnect '${name}'"
+  done < <(nmcli -t -f NAME,TYPE connection show)
+}
+
 apply_static_ipv4() {
   local profile="$1"
   local cidr="$2"
   nmcli connection modify "${profile}" \
     connection.autoconnect yes \
-    connection.autoconnect-priority 100 \
+    connection.autoconnect-priority "${FIELD_WIFI_AUTOCONNECT_PRIORITY}" \
     ipv4.method manual \
     ipv4.addresses "${cidr}" \
     ipv4.gateway "${LAN_GATEWAY}" \
@@ -145,11 +166,11 @@ apply_live_ipv4_prefix() {
   fi
   if [[ "${live}" == "${cidr}" ]]; then
     log "${iface} already ${cidr}"
-  else
-    log "same host ${host}; apply ${live} -> ${cidr} without reconnect"
-    ip addr add "${cidr}" dev "${iface}" 2>/dev/null || true
-    ip addr del "${live}" dev "${iface}" 2>/dev/null || true
+    return 0
   fi
+  log "same host ${host}; apply ${live} -> ${cidr} without reconnect"
+  ip addr add "${cidr}" dev "${iface}" 2>/dev/null || true
+  ip addr del "${live}" dev "${iface}" 2>/dev/null || true
   if nmcli device reapply "${iface}"; then
     log "nmcli device reapply ${iface}"
   else
@@ -188,7 +209,7 @@ else
   nmcli connection add type wifi ifname "${WIFI_IFACE}" con-name "${WIFI_SSID}" \
     ssid "${WIFI_SSID}" \
     connection.autoconnect yes \
-    connection.autoconnect-priority 100 \
+    connection.autoconnect-priority "${FIELD_WIFI_AUTOCONNECT_PRIORITY}" \
     802-11-wireless-security.key-mgmt wpa-psk \
     802-11-wireless-security.psk "${WIFI_PASSWORD}" \
     ipv4.method manual \
@@ -198,6 +219,7 @@ else
     ipv4.ignore-auto-dns yes
   profile="${WIFI_SSID}"
 fi
+demote_competing_wifi_profiles "${profile}"
 log "NM saved ${profile} -> ${cidr} gw ${LAN_GATEWAY} dns ${LAN_DNS}"
 apply_live_ipv4_prefix "${WIFI_IFACE}" "${cidr}"
 log "next: Insert apply network"
