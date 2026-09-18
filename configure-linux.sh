@@ -328,6 +328,23 @@ apt_update_resilient() {
       return 0
     fi
     cat "${logf}" >&2 || true
+    if grep -Eq 'Could not get lock|Unable to lock directory|Unable to lock the administration directory|无法获得锁|Resource temporarily unavailable' "${logf}"; then
+      rm -f "${logf}"
+      log "apt lock busy; wait and retry"
+      wait_dpkg_lock
+      sleep 3
+      attempt=$((attempt + 1))
+      continue
+    fi
+    if grep -Eq 'not valid yet|Release file .* expired|Release 文件已经过期|Clock skew detected' "${logf}"; then
+      rm -f "${logf}"
+      log "apt InRelease rejected as expired/not-yet-valid; resync clock"
+      sync_clock_from_http
+      wait_dpkg_lock
+      sleep 2
+      attempt=$((attempt + 1))
+      continue
+    fi
     if [[ "${SKIP_QUARANTINE_SOURCES}" -ne 0 ]]; then
       rm -f "${logf}"
       die "apt-get update failed and --skip-quarantine-sources is set"
@@ -467,12 +484,16 @@ note_preexisting_uart_baud() {
   fi
 }
 
+http_date_from_headers() {
+  tr -d '\r' | grep -i '^Date:' | head -n1 | cut -d' ' -f2-
+}
+
 sync_clock_from_http() {
   # Companion clocks often sit days behind; apt then refuses InRelease.
   local url hdr epoch_http epoch_now skew
   url="${APT_BASE_URL%/}/dists/${APT_SUITE}/InRelease"
   hdr="$(curl -sI --connect-timeout 8 --max-time 15 "${url}" 2>/dev/null \
-    | awk 'BEGIN{IGNORECASE=1} /^Date:/{sub(/^Date:[[:space:]]*/,""); gsub(/\r/,""); print; exit}')"
+    | http_date_from_headers)"
   if [[ -z "${hdr}" ]]; then
     warn "no HTTP Date from apt; leave companion clock"
     return 0
@@ -493,6 +514,7 @@ sync_clock_from_http() {
   fi
   date -u -s "$(date -u -d "${hdr}" '+%Y-%m-%d %H:%M:%S')" >/dev/null
   log "set clock from apt HTTP Date (${hdr}); was ${skew}s off"
+  sleep 3
 }
 
 write_retract_pin() {
@@ -537,10 +559,12 @@ retire_rates_helper() {
 wait_dpkg_lock() {
   local n=0
   while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
-    || fuser /var/lib/dpkg/lock >/dev/null 2>&1; do
+    || fuser /var/lib/dpkg/lock >/dev/null 2>&1 \
+    || fuser /var/lib/apt/lists/lock >/dev/null 2>&1 \
+    || fuser /var/cache/apt/archives/lock >/dev/null 2>&1; do
     n=$((n + 1))
-    if [[ "${n}" -gt 30 ]]; then
-      die "dpkg lock still held after 60s"
+    if [[ "${n}" -gt 60 ]]; then
+      die "apt/dpkg lock still held after 120s"
     fi
     log "wait dpkg lock (${n})"
     sleep 2
@@ -550,6 +574,7 @@ wait_dpkg_lock() {
 install_router_package() {
   sync_clock_from_http
   write_retract_pin
+  wait_dpkg_lock
   apt_update_resilient
   assert_router_not_retracted
   wait_dpkg_lock
